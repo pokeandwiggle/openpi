@@ -63,11 +63,14 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# rerun-sdk>=0.24 (pulled by the lerobot fork for viz only, not on the dataset-read
+# path) forces numpy>=2, which conflicts with openpi's numpy<2 pin (TF 2.15). Pin it
+# back to the last numpy<2-compatible release.
+override-dependencies = ["ml-dtypes==0.4.1", "rerun-sdk<0.24", "tensorstore==0.1.74"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
-lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
+lerobot = { git = "https://github.com/pokeandwiggle/lerobot", rev = "a7d250c07342cf3dee538e8cf8d94ddee6638fb1" }
 dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
 
 [tool.uv.workspace]

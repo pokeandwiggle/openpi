@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.paw_policy as paw_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -350,6 +351,30 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotPawDataConfig(DataConfigFactory):
+    """Data config for the Poke & Wiggle dual-FR3 pedestal dataset.
+
+    Our LeRobot dataset stores state and action as per-arm sub-feature columns
+    rather than flat vectors, so ``PawInputs`` (not a RepackTransform) does the
+    concatenation. ``action_sequence_keys`` lists the four action columns so the
+    loader applies the action-horizon delta_timestamps to each.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[paw_policy.PawInputs(model_type=model_config.model_type)],
+            outputs=[paw_policy.PawOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
@@ -760,6 +785,41 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Poke & Wiggle pi0.5 full fine-tune (dual-FR3 pedestal, right-arm only).
+    #
+    TrainConfig(
+        name="pi05_paw_duplo",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_on_marked_area_3x_and_all_recoveries_06-17T19-48",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        # Full fine-tune (no LoRA) on a single A100 80GB.
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=60_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=60_000,
+        num_workers=10,
+        # Checkpoints (~42GB each) stay on local disk and keep ONLY the latest:
+        # orbax/OCDBT commits by directory-rename, which fails on the gcsfuse bucket
+        # (see PI05_CHECKPOINT_STORAGE.md). keep_period=None + max_to_keep=1 means
+        # peak disk during a save is 2x42GB, well within the 193GB disk. Push the
+        # final checkpoint to /data/models manually for durability.
+        keep_period=None,
+        save_interval=5_000,
     ),
     #
     # Fine-tuning Aloha configs.
