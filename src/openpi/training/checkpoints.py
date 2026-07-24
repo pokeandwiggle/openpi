@@ -20,7 +20,10 @@ import openpi.training.utils as training_utils
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
-    checkpoint_dir = epath.Path(checkpoint_dir).resolve()
+    checkpoint_dir = epath.Path(checkpoint_dir)
+    if "://" not in str(checkpoint_dir):
+        # resolve() mangles remote URLs (gs://a -> $CWD/gs:/a); only resolve local paths.
+        checkpoint_dir = checkpoint_dir.resolve()
     resuming = False
     if checkpoint_dir.exists():
         if overwrite:
@@ -36,6 +39,10 @@ def initialize_checkpoint_dir(
             )
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if "://" in str(checkpoint_dir):
+        # GCS has no directories: mkdir is a no-op and exists() on an empty prefix is
+        # False, which trips orbax's root-dir check. A marker object fixes both.
+        (checkpoint_dir / ".keep").write_text("")
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -47,7 +54,8 @@ def initialize_checkpoint_dir(
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
             keep_period=keep_period,
-            create=False,
+            # create=True so the root exists on GCS too (mkdir above is a no-op there).
+            create=True,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )

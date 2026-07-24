@@ -11,7 +11,7 @@ left-arm dims so they normalize to ~0 (and unnormalize back to their mean):
     q99  -> mean + 0.5   (mean kept)
 
 Run after ``compute_norm_stats.py``:
-    uv run scripts/squash_paw_left_arm.py --config-name pi05_paw_duplo
+    uv run scripts/squash_paw_left_arm.py --repo-id pokeandwiggle/<dataset>
 """
 
 import dataclasses
@@ -24,10 +24,12 @@ import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 
 
-def main(config_name: str = "pi05_paw_duplo") -> None:
+def main(config_name: str = "pi05_paw", repo_id: str | None = None) -> None:
     config = _config.get_config(config_name)
+    if repo_id is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, repo_id=repo_id))
     data_config = config.data.create(config.assets_dirs, config.model)
-    stats_dir = config.assets_dirs / data_config.repo_id
+    stats_dir = config.assets_dirs / data_config.asset_id
 
     stats = normalize.load(stats_dir)
     dims = list(paw_policy.LEFT_ARM_DIMS)

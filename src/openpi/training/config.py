@@ -565,11 +565,14 @@ class TrainConfig:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
 
     @property
-    def checkpoint_dir(self) -> pathlib.Path:
+    def checkpoint_dir(self) -> epath.Path:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        # pathlib/resolve() mangle remote URLs (gs://a -> $CWD/gs:/a); only resolve local paths.
+        if "://" in self.checkpoint_base_dir:
+            return epath.Path(self.checkpoint_base_dir) / self.name / self.exp_name
+        return epath.Path((pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve())
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -787,39 +790,41 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     #
-    # Poke & Wiggle pi0.5 full fine-tune (dual-FR3 pedestal, right-arm only).
+    # Poke & Wiggle pi0.5 full fine-tune (dual-FR3 pedestal, right-arm only),
+    # 32-step action chunks. The dataset is a required CLI arg:
+    #   uv run scripts/train.py pi05_paw --exp_name=... --data.repo_id=pokeandwiggle/<dataset>
     #
     TrainConfig(
-        name="pi05_paw_duplo",
+        name="pi05_paw",
         project_name="pi",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        # repo_id is deliberately left unset (tyro.MISSING) so every run must pass
+        # --data.repo_id; norm stats are keyed by it (asset_id defaults to repo_id).
         data=LeRobotPawDataConfig(
-            repo_id="pokeandwiggle/stack_duplo_brick_on_marked_area_3x_and_all_recoveries_06-17T19-48",
             base_config=DataConfig(
                 prompt_from_task=True,
                 action_sequence_keys=paw_policy.ACTION_KEYS,
             ),
         ),
-        # Full fine-tune (no LoRA) on a single A100 80GB.
+        # Full fine-tune (no LoRA) on a single H100 80GB.
         batch_size=32,
+        # Constant LR at 5e-5 after warmup (decay_lr == peak_lr).
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,
-            decay_steps=60_000,
-            decay_lr=5e-6,
+            decay_steps=10_000,
+            decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=60_000,
+        num_train_steps=10_000,
         num_workers=10,
-        # Checkpoints (~42GB each) stay on local disk and keep ONLY the latest:
-        # orbax/OCDBT commits by directory-rename, which fails on the gcsfuse bucket
-        # (see PI05_CHECKPOINT_STORAGE.md). keep_period=None + max_to_keep=1 means
-        # peak disk during a save is 2x42GB, well within the 193GB disk. Push the
-        # final checkpoint to /data/models manually for durability.
-        keep_period=None,
-        save_interval=5_000,
+        # Save every 1k for crash recovery (max_to_keep=1 prunes them), keep every
+        # 10k on the local-SSD RAID0; the sync sidecar copies keepers to GCS.
+        checkpoint_base_dir="/mnt/localssd/checkpoints",
+        save_interval=1_000,
+        keep_period=10_000,
     ),
     TrainConfig(
         name="pi05_stack_duplo_brick_marked_fast_push_100eps_plus_sel_int_cut_interventions_skip_300ms_32",
