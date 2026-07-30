@@ -126,7 +126,12 @@ class RMSNorm(nn.Module):
 
         # adaptive RMSNorm
         modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
-        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        if modulation.ndim == 2:
+            # (b, 3d) conditioning: one flow matching timestep shared by every token.
+            modulation = modulation[:, None, :]
+        # otherwise (b, s, 3d): scale/shift/gate differ per token, which is what training-time RTC
+        # needs to give the action prefix a different flow matching timestep than the postfix.
+        scale, shift, gate = jnp.split(modulation, 3, axis=-1)
         normed_inputs = normed_inputs * (1 + scale) + shift  # scale and shift in float32
         return normed_inputs.astype(dtype), gate
 
@@ -392,7 +397,9 @@ class Module(nn.Module):
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        # per-expert adaRMS conditioning: (b, d) for one timestep shared by all tokens, or
+        # (b, s, d) for a per-token timestep (training-time RTC).
+        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | at.Float[at.Array, "b _s _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         deterministic: bool = True,

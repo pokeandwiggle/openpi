@@ -46,8 +46,8 @@ def make_attn_mask(input_mask, mask_ar):
 
 @at.typecheck
 def posemb_sincos(
-    pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
-) -> at.Float[at.Array, "b {embedding_dim}"]:
+    pos: at.Real[at.Array, "*b"], embedding_dim: int, min_period: float, max_period: float
+) -> at.Float[at.Array, "*b {embedding_dim}"]:
     """Computes sine-cosine positional embedding vectors for scalar positions."""
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
@@ -55,7 +55,7 @@ def posemb_sincos(
     fraction = jnp.linspace(0.0, 1.0, embedding_dim // 2)
     period = min_period * (max_period / min_period) ** fraction
     sinusoid_input = jnp.einsum(
-        "i,j->ij",
+        "...,j->...j",
         pos,
         1.0 / period * 2 * jnp.pi,
         precision=jax.lax.Precision.HIGHEST,
@@ -67,6 +67,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.rtc_delay = config.rtc_delay
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -138,12 +139,17 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def embed_suffix(
-        self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]
+        self,
+        obs: _model.Observation,
+        noisy_actions: _model.Actions,
+        # (b,) for one flow matching timestep per example, or (b, ah) for one per action step
+        # (training-time RTC, where the prefix is pinned to the clean end of the schedule).
+        timestep: at.Float[at.Array, " b"] | at.Float[at.Array, "b ah"],
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
         at.Bool[at.Array, "b s"],
         at.Bool[at.Array, " s"],
-        at.Float[at.Array, "b emb"] | None,
+        at.Float[at.Array, "b emb"] | at.Float[at.Array, "b ah emb"] | None,
     ]:
         input_mask = []
         ar_mask = []
@@ -169,6 +175,8 @@ class Pi0(_model.BaseModel):
             adarms_cond = time_emb
         else:
             # mix timestep + action information using an MLP (no adaRMS)
+            if time_emb.ndim != 2:
+                raise ValueError("per-action-step timesteps (training-time RTC) require pi05=True")
             time_tokens = einops.repeat(time_emb, "b emb -> b s emb", s=self.action_horizon)
             action_time_tokens = jnp.concatenate([action_tokens, time_tokens], axis=-1)
             action_time_tokens = self.action_time_mlp_in(action_time_tokens)
@@ -196,6 +204,20 @@ class Pi0(_model.BaseModel):
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
+
+        # note: `prefix_mask` below refers to the PaliGemma (image/language) token prefix; this one
+        # selects the action prefix steps within the chunk.
+        rtc_mask = None
+        if self.rtc_delay is not None:
+            # Training-time RTC: the first `rtc_delay` actions are the action prefix. Pin their
+            # timestep to the *clean* end of the schedule, which is t=0 here (this repo integrates
+            # t=1 -> t=0, the opposite of the paper), so x_t holds the ground-truth actions there.
+            if len(batch_shape) != 1:
+                raise ValueError(f"rtc_delay requires a single batch dimension, got shape {batch_shape}")
+            rtc_mask = jnp.arange(self.action_horizon) < self.rtc_delay  # (ah,)
+            time = jnp.where(rtc_mask, 0.0, time[..., None])  # (b, ah)
+            time_expanded = time[..., None]
+
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
@@ -211,7 +233,12 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if rtc_mask is not None:
+            # Supervise the postfix only. Rescaling by ah / (ah - rtc_delay) keeps the caller's
+            # plain mean over the chunk equal to the postfix-normalized mean of the paper.
+            loss = jnp.where(rtc_mask, 0.0, loss) * (self.action_horizon / (self.action_horizon - self.rtc_delay))
+        return loss
 
     @override
     def sample_actions(
@@ -221,7 +248,17 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        # Training-time RTC: the actions already committed to the robot, padded to the full action
+        # horizon; only the first `rtc_delay` entries are read. Must be in the model's *normalized*
+        # action space, i.e. the same space as the `actions` seen during training.
+        action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        if (self.rtc_delay is None) != (action_prefix is None):
+            raise ValueError(
+                f"action_prefix must be passed iff the model was configured with rtc_delay "
+                f"(rtc_delay={self.rtc_delay}, action_prefix={'given' if action_prefix is not None else None})"
+            )
+
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -229,6 +266,12 @@ class Pi0(_model.BaseModel):
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # note: `prefix_mask` below refers to the PaliGemma (image/language) token prefix; this one
+        # selects the action prefix steps within the chunk.
+        rtc_mask = None
+        if self.rtc_delay is not None:
+            rtc_mask = jnp.arange(self.action_horizon) < self.rtc_delay  # (ah,)
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -238,9 +281,13 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
+            if rtc_mask is None:
+                timestep = jnp.broadcast_to(time, batch_size)
+            else:
+                # hold the committed actions fixed and mark them as already denoised (t=0)
+                x_t = jnp.where(rtc_mask[None, :, None], action_prefix, x_t)
+                timestep = jnp.where(rtc_mask[None, :], 0.0, jnp.broadcast_to(time, (batch_size, self.action_horizon)))
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, timestep)
             # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
             # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -276,4 +323,7 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        if rtc_mask is not None:
+            # return the committed actions exactly as given, not the integrator's copy of them
+            x_0 = jnp.where(rtc_mask[None, :, None], action_prefix, x_0)
         return x_0
