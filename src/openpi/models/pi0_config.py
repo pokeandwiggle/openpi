@@ -31,6 +31,11 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Training-time real-time chunking (arXiv 2512.05964): simulate an inference delay of
+    # ``rtc_delay`` steps by conditioning on that many ground-truth actions as a clean prefix and
+    # computing the loss on the remaining postfix only. None disables it. Unlike the paper, which
+    # samples the delay per example, this POC uses one constant delay.
+    rtc_delay: int | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -39,6 +44,11 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.rtc_delay is not None:
+            if not self.pi05:
+                raise ValueError("rtc_delay is only implemented for pi05=True")
+            if not 0 <= self.rtc_delay < self.action_horizon:
+                raise ValueError(f"rtc_delay must be in [0, {self.action_horizon}), got {self.rtc_delay}")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
