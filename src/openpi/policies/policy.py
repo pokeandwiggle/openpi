@@ -65,7 +65,13 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(
+        self,
+        obs: dict,
+        *,
+        action_prefix: np.ndarray | None = None,
+        noise: np.ndarray | None = None,
+    ) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -87,6 +93,17 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
+        if action_prefix is not None:
+            # Training-time RTC: the committed actions, in the model's normalized action
+            # space (see Pi0.sample_actions). Per-call, so it cannot live in sample_kwargs
+            # passed at construction.
+            if self._is_pytorch_model:
+                raise NotImplementedError("action_prefix is only supported for JAX models")
+            prefix = jnp.asarray(action_prefix)
+            if prefix.ndim == 2:  # (action_horizon, action_dim) -> add batch dimension
+                prefix = prefix[None, ...]
+            sample_kwargs["action_prefix"] = prefix
+
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         outputs = {
@@ -99,7 +116,11 @@ class Policy(BasePolicy):
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
+        # The raw model output before unnormalization — the space `action_prefix`
+        # expects, so a serving loop can feed a slice of this chunk back verbatim.
+        actions_norm = np.array(outputs["actions"])
         outputs = self._output_transform(outputs)
+        outputs["actions_norm"] = actions_norm
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
