@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.paw_policy as paw_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -356,6 +357,30 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotPawDataConfig(DataConfigFactory):
+    """Data config for the Poke & Wiggle dual-FR3 pedestal dataset.
+
+    Our LeRobot dataset stores state and action as per-arm sub-feature columns
+    rather than flat vectors, so ``PawInputs`` (not a RepackTransform) does the
+    concatenation. ``action_sequence_keys`` lists the four action columns so the
+    loader applies the action-horizon delta_timestamps to each.
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[paw_policy.PawInputs(model_type=model_config.model_type)],
+            outputs=[paw_policy.PawOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -540,11 +565,14 @@ class TrainConfig:
         return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
 
     @property
-    def checkpoint_dir(self) -> pathlib.Path:
+    def checkpoint_dir(self) -> epath.Path:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        # pathlib/resolve() mangle remote URLs (gs://a -> $CWD/gs:/a); only resolve local paths.
+        if "://" in self.checkpoint_base_dir:
+            return epath.Path(self.checkpoint_base_dir) / self.name / self.exp_name
+        return epath.Path((pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve())
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -760,6 +788,251 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Poke & Wiggle pi0.5 full fine-tune (dual-FR3 pedestal, right-arm only),
+    # 32-step action chunks. The dataset is a required CLI arg:
+    #   uv run scripts/train.py pi05_paw --exp_name=... --data.repo_id=pokeandwiggle/<dataset>
+    #
+    TrainConfig(
+        name="pi05_paw",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        # repo_id is deliberately left unset (tyro.MISSING) so every run must pass
+        # --data.repo_id; norm stats are keyed by it (asset_id defaults to repo_id).
+        data=LeRobotPawDataConfig(
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        # Full fine-tune (no LoRA) on a single H100 80GB.
+        batch_size=32,
+        # Constant LR at 5e-5 after warmup (decay_lr == peak_lr).
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        num_workers=10,
+        # Save every 1k for crash recovery (max_to_keep=1 prunes them), keep every
+        # 10k on the local-SSD RAID0; the sync sidecar copies keepers to GCS.
+        checkpoint_base_dir="/mnt/localssd/checkpoints",
+        save_interval=1_000,
+        keep_period=10_000,
+    ),
+    TrainConfig(
+        name="pi05_stack_duplo_brick_marked_fast_push_100eps_plus_sel_int_cut_interventions_skip_300ms_32",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_marked_fast_push_100eps_plus_sel_int_07-16T22-06_cut_interventions_skip_300ms",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_stack_duplo_brick_marked_fast_push_100eps_plus_sel_int_cut_interventions_32",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_marked_fast_push_100eps_plus_sel_int_07-16T22-06_cut_interventions",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_stack_duplo_brick_on_marked_area_fast_push_x2_07-11T13-51",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_on_marked_area_fast_push_x2_07-11T13-51",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_duplo_fast_push_100_eps_plus_20_int_3_small_cut_interventions_32",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/duplo_brick_on_marked_area_fast_push_100_eps_plus_20_int_3_small_07-10T23-11_cut_interventions",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_duplo_brick_on_marked_area_fast_push_100_eps_plus_20_int_2_07-10T23-01_cut_interventions",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/duplo_brick_on_marked_area_fast_push_100_eps_plus_20_int_2_07-10T23-01_cut_interventions",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_paw_duplo_push_int_32",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_fast_push_100_plus_int_20",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_paw_duplo_2x_push_48",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=48, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_on_marked_area_2x_and_fast_push_100_07-08T21-17",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
+    ),
+    TrainConfig(
+        name="pi05_paw_fast_push",
+        project_name="pi",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=32, discrete_state_input=False),
+        data=LeRobotPawDataConfig(
+            repo_id="pokeandwiggle/stack_duplo_brick_on_marked_area_fast_push_100_eps_07-08T19-48",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=paw_policy.ACTION_KEYS,
+            ),
+        ),
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        num_workers=10,
+        keep_period=None,
+        save_interval=5_000,
     ),
     #
     # Fine-tuning Aloha configs.
