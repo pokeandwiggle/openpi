@@ -34,8 +34,16 @@ class Pi0Config(_model.BaseModelConfig):
     # Training-time real-time chunking (arXiv 2512.05964): simulate an inference delay of
     # ``rtc_delay`` steps by conditioning on that many ground-truth actions as a clean prefix and
     # computing the loss on the remaining postfix only. None disables it. Unlike the paper, which
-    # samples the delay per example, this POC uses one constant delay.
+    # samples the delay per example, this uses one constant delay — inference configs always use
+    # this form, with the delay the deployment actually serves.
     rtc_delay: int | None = None
+    # Per-example delay sampling (the paper's scheme): entry ``i`` is the probability of an
+    # ``i``-step delay, drawn independently for every training example. The last entry must be
+    # positive (trailing zeros are refused), so ``len(rtc_delay_probs) - 1`` is the largest delay
+    # the checkpoint learns to condition on. Training-only and mutually exclusive with
+    # ``rtc_delay``: at inference the served delay is one concrete number, so a checkpoint trained
+    # with this is served with ``rtc_delay`` set instead.
+    rtc_delay_probs: tuple[float, ...] | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -49,6 +57,31 @@ class Pi0Config(_model.BaseModelConfig):
                 raise ValueError("rtc_delay is only implemented for pi05=True")
             if not 0 <= self.rtc_delay < self.action_horizon:
                 raise ValueError(f"rtc_delay must be in [0, {self.action_horizon}), got {self.rtc_delay}")
+        if self.rtc_delay_probs is not None:
+            # A caller building the config from parsed JSON hands a list; normalize so the config
+            # stays hashable.
+            object.__setattr__(self, "rtc_delay_probs", tuple(float(p) for p in self.rtc_delay_probs))
+            if not self.pi05:
+                raise ValueError("rtc_delay_probs is only implemented for pi05=True")
+            if self.rtc_delay is not None:
+                raise ValueError(
+                    "rtc_delay and rtc_delay_probs are mutually exclusive: a constant delay is "
+                    "rtc_delay_probs with all mass on one entry"
+                )
+            if not 1 <= len(self.rtc_delay_probs) - 1 < self.action_horizon:
+                raise ValueError(
+                    f"rtc_delay_probs covers delays 0..len-1, so it needs 2..{self.action_horizon} "
+                    f"entries, got {len(self.rtc_delay_probs)}"
+                )
+            if min(self.rtc_delay_probs) < 0:
+                raise ValueError(f"rtc_delay_probs must be non-negative, got {self.rtc_delay_probs}")
+            if self.rtc_delay_probs[-1] == 0:
+                raise ValueError(
+                    "the last entry of rtc_delay_probs must be positive: trailing zeros would hide "
+                    "the largest delay the checkpoint is trained for"
+                )
+            if abs(sum(self.rtc_delay_probs) - 1.0) > 1e-6:
+                raise ValueError(f"rtc_delay_probs must sum to 1, got {sum(self.rtc_delay_probs)}")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",

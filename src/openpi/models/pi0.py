@@ -68,6 +68,7 @@ class Pi0(_model.BaseModel):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         self.rtc_delay = config.rtc_delay
+        self.rtc_delay_probs = config.rtc_delay_probs
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -197,7 +198,13 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        # The extra key is only split off when per-example delays are on, so the constant-delay and
+        # no-RTC paths keep drawing exactly the noise and times they always did.
+        delay_rng = None
+        if self.rtc_delay_probs is not None:
+            preprocess_rng, noise_rng, time_rng, delay_rng = jax.random.split(rng, 4)
+        else:
+            preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
@@ -208,13 +215,22 @@ class Pi0(_model.BaseModel):
         # note: `prefix_mask` below refers to the PaliGemma (image/language) token prefix; this one
         # selects the action prefix steps within the chunk.
         rtc_mask = None
-        if self.rtc_delay is not None:
-            # Training-time RTC: the first `rtc_delay` actions are the action prefix. Pin their
-            # timestep to the *clean* end of the schedule, which is t=0 here (this repo integrates
-            # t=1 -> t=0, the opposite of the paper), so x_t holds the ground-truth actions there.
+        rtc_delays = None
+        if self.rtc_delay is not None or self.rtc_delay_probs is not None:
+            # Training-time RTC: the first `delay` actions of each example are the action prefix.
+            # Pin their timestep to the *clean* end of the schedule, which is t=0 here (this repo
+            # integrates t=1 -> t=0, the opposite of the paper), so x_t holds the ground-truth
+            # actions there.
             if len(batch_shape) != 1:
-                raise ValueError(f"rtc_delay requires a single batch dimension, got shape {batch_shape}")
-            rtc_mask = jnp.arange(self.action_horizon) < self.rtc_delay  # (ah,)
+                raise ValueError(f"rtc delay conditioning requires a single batch dimension, got shape {batch_shape}")
+            if self.rtc_delay_probs is not None:
+                # The paper's scheme: each example draws its own delay. log(0) = -inf keeps
+                # zero-probability delays from ever being drawn.
+                logits = jnp.log(jnp.asarray(self.rtc_delay_probs))
+                rtc_delays = jax.random.categorical(delay_rng, logits, shape=batch_shape)  # (b,)
+            else:
+                rtc_delays = jnp.full(batch_shape, self.rtc_delay)  # (b,)
+            rtc_mask = jnp.arange(self.action_horizon)[None, :] < rtc_delays[:, None]  # (b, ah)
             time = jnp.where(rtc_mask, 0.0, time[..., None])  # (b, ah)
             time_expanded = time[..., None]
 
@@ -235,9 +251,9 @@ class Pi0(_model.BaseModel):
 
         loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
         if rtc_mask is not None:
-            # Supervise the postfix only. Rescaling by ah / (ah - rtc_delay) keeps the caller's
+            # Supervise the postfix only. Rescaling by ah / (ah - delay) keeps the caller's
             # plain mean over the chunk equal to the postfix-normalized mean of the paper.
-            loss = jnp.where(rtc_mask, 0.0, loss) * (self.action_horizon / (self.action_horizon - self.rtc_delay))
+            loss = jnp.where(rtc_mask, 0.0, loss) * (self.action_horizon / (self.action_horizon - rtc_delays))[:, None]
         return loss
 
     @override
@@ -253,6 +269,11 @@ class Pi0(_model.BaseModel):
         # action space, i.e. the same space as the `actions` seen during training.
         action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        if self.rtc_delay_probs is not None:
+            raise ValueError(
+                "rtc_delay_probs is a training-time setting; build the inference config with "
+                "rtc_delay set to the concrete delay being served instead"
+            )
         if (self.rtc_delay is None) != (action_prefix is None):
             raise ValueError(
                 f"action_prefix must be passed iff the model was configured with rtc_delay "
