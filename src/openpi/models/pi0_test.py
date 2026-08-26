@@ -1,5 +1,6 @@
 import flax.nnx as nnx
 import jax
+import pytest
 
 import openpi.models.pi0_config as _pi0_config
 
@@ -44,3 +45,26 @@ def test_pi0_all_lora():
     assert len(state) == 17
     assert all("lora" not in p for p in state)
     assert all("llm" in p for p in state)
+
+
+def test_rtc_delay_probs_accepts_a_distribution():
+    config = _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=[0.25, 0.0, 0.0, 0.0, 0.75])
+    # Normalized to a tuple so the config stays hashable when built from parsed JSON.
+    assert config.rtc_delay_probs == (0.25, 0.0, 0.0, 0.0, 0.75)
+
+
+def test_rtc_delay_probs_rejects_bad_distributions():
+    with pytest.raises(ValueError, match="pi05=True"):
+        _pi0_config.Pi0Config(rtc_delay_probs=(0.5, 0.5))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _pi0_config.Pi0Config(pi05=True, rtc_delay=2, rtc_delay_probs=(0.5, 0.5))
+    with pytest.raises(ValueError, match="entries"):
+        _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(1.0,))
+    with pytest.raises(ValueError, match="entries"):
+        _pi0_config.Pi0Config(pi05=True, action_horizon=4, rtc_delay_probs=(0.0, 0.0, 0.0, 0.0, 1.0))
+    with pytest.raises(ValueError, match="non-negative"):
+        _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(0.75, -0.25, 0.5))
+    with pytest.raises(ValueError, match="last entry"):
+        _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(0.5, 0.5, 0.0))
+    with pytest.raises(ValueError, match="sum to 1"):
+        _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(0.5, 0.4))
