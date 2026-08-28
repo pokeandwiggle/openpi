@@ -266,7 +266,10 @@ class Pi0(_model.BaseModel):
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         # Training-time RTC: the actions already committed to the robot, padded to the full action
         # horizon; only the first `rtc_delay` entries are read. Must be in the model's *normalized*
-        # action space, i.e. the same space as the `actions` seen during training.
+        # action space, i.e. the same space as the `actions` seen during training. None samples the
+        # chunk unconditioned — the delay-0 mode a `rtc_delay_probs`-trained checkpoint saw whenever
+        # training drew delay 0 — for calls where nothing is committed yet (episode start, recovery
+        # after a stale gap).
         action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
         if self.rtc_delay_probs is not None:
@@ -274,11 +277,8 @@ class Pi0(_model.BaseModel):
                 "rtc_delay_probs is a training-time setting; build the inference config with "
                 "rtc_delay set to the concrete delay being served instead"
             )
-        if (self.rtc_delay is None) != (action_prefix is None):
-            raise ValueError(
-                f"action_prefix must be passed iff the model was configured with rtc_delay "
-                f"(rtc_delay={self.rtc_delay}, action_prefix={'given' if action_prefix is not None else None})"
-            )
+        if self.rtc_delay is None and action_prefix is not None:
+            raise ValueError("action_prefix requires the model to be configured with rtc_delay")
 
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -291,7 +291,7 @@ class Pi0(_model.BaseModel):
         # note: `prefix_mask` below refers to the PaliGemma (image/language) token prefix; this one
         # selects the action prefix steps within the chunk.
         rtc_mask = None
-        if self.rtc_delay is not None:
+        if self.rtc_delay is not None and action_prefix is not None:
             rtc_mask = jnp.arange(self.action_horizon) < self.rtc_delay  # (ah,)
 
         # first fill KV cache with a forward pass of the prefix

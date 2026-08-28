@@ -1,5 +1,6 @@
 import flax.nnx as nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
 import openpi.models.pi0_config as _pi0_config
@@ -68,3 +69,51 @@ def test_rtc_delay_probs_rejects_bad_distributions():
         _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(0.5, 0.5, 0.0))
     with pytest.raises(ValueError, match="sum to 1"):
         _pi0_config.Pi0Config(pi05=True, rtc_delay_probs=(0.5, 0.4))
+
+
+def _tiny_config(**overrides) -> _pi0_config.Pi0Config:
+    return _pi0_config.Pi0Config(
+        pi05=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+        action_dim=4,
+        action_horizon=8,
+        max_token_len=16,
+        **overrides,
+    )
+
+
+def test_sample_actions_without_a_prefix_matches_the_unconditioned_model():
+    # A checkpoint trained with rtc_delay_probs saw the unconditioned (delay-0) mode on every
+    # example whose sampled delay was 0. Serving that mode is a per-call choice — no prefix —
+    # and must run exactly the baseline sampling path.
+    key = jax.random.key(0)
+    obs = _tiny_config().fake_obs(1)
+    noise = jax.random.normal(jax.random.key(1), (1, 8, 4))
+
+    rtc_model = _tiny_config(rtc_delay=2).create(key)
+    baseline_model = _tiny_config().create(key)
+
+    unprefixed = rtc_model.sample_actions(key, obs, num_steps=2, noise=noise)
+    baseline = baseline_model.sample_actions(key, obs, num_steps=2, noise=noise)
+    assert jnp.array_equal(unprefixed, baseline)
+
+
+def test_sample_actions_returns_a_given_prefix_verbatim():
+    key = jax.random.key(0)
+    model = _tiny_config(rtc_delay=2).create(key)
+    obs = _tiny_config().fake_obs(1)
+    prefix = jnp.zeros((1, 8, 4)).at[:, :2].set(0.5)
+
+    actions = model.sample_actions(key, obs, num_steps=2, action_prefix=prefix)
+
+    assert jnp.array_equal(actions[:, :2], prefix[:, :2])
+
+
+def test_sample_actions_refuses_a_prefix_without_rtc_delay():
+    key = jax.random.key(0)
+    model = _tiny_config().create(key)
+    obs = _tiny_config().fake_obs(1)
+
+    with pytest.raises(ValueError, match="rtc_delay"):
+        model.sample_actions(key, obs, num_steps=1, action_prefix=jnp.zeros((1, 8, 4)))

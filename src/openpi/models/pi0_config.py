@@ -42,7 +42,8 @@ class Pi0Config(_model.BaseModelConfig):
     # positive (trailing zeros are refused), so ``len(rtc_delay_probs) - 1`` is the largest delay
     # the checkpoint learns to condition on. Training-only and mutually exclusive with
     # ``rtc_delay``: at inference the served delay is one concrete number, so a checkpoint trained
-    # with this is served with ``rtc_delay`` set instead.
+    # with this is served with ``rtc_delay`` set instead; a serve-time call without a prefix then
+    # samples the unconditioned delay-0 mode.
     rtc_delay_probs: tuple[float, ...] | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"
