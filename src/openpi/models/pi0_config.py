@@ -40,10 +40,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Per-example delay sampling (the paper's scheme): entry ``i`` is the probability of an
     # ``i``-step delay, drawn independently for every training example. The last entry must be
     # positive (trailing zeros are refused), so ``len(rtc_delay_probs) - 1`` is the largest delay
-    # the checkpoint learns to condition on. Training-only and mutually exclusive with
-    # ``rtc_delay``: at inference the served delay is one concrete number, so a checkpoint trained
-    # with this is served with ``rtc_delay`` set instead; a serve-time call without a prefix then
-    # samples the unconditioned delay-0 mode.
+    # the checkpoint learns to condition on. Mutually exclusive with ``rtc_delay``. Only the loss
+    # reads it: ``sample_actions`` without a prefix runs the unconditioned delay-0 mode whichever
+    # field is set, and a prefix needs ``rtc_delay`` — the concrete number of steps it pins — so a
+    # checkpoint trained with this is served with ``rtc_delay`` set to the delay being served.
     rtc_delay_probs: tuple[float, ...] | None = None
 
     pytorch_compile_mode: str | None = "max-autotune"

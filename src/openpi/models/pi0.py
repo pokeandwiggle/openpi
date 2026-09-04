@@ -269,14 +269,11 @@ class Pi0(_model.BaseModel):
         # action space, i.e. the same space as the `actions` seen during training. None samples the
         # chunk unconditioned — the delay-0 mode a `rtc_delay_probs`-trained checkpoint saw whenever
         # training drew delay 0 — for calls where nothing is committed yet (episode start, recovery
-        # after a stale gap).
+        # after a stale gap). `rtc_delay_probs` itself is never read here: a distribution says
+        # nothing about one call, so a model still carrying it (the training graph, sampled for a
+        # held-out check) behaves exactly like the unconditioned baseline.
         action_prefix: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        if self.rtc_delay_probs is not None:
-            raise ValueError(
-                "rtc_delay_probs is a training-time setting; build the inference config with "
-                "rtc_delay set to the concrete delay being served instead"
-            )
         if self.rtc_delay is None and action_prefix is not None:
             raise ValueError("action_prefix requires the model to be configured with rtc_delay")
 
