@@ -99,6 +99,22 @@ def test_sample_actions_without_a_prefix_matches_the_unconditioned_model():
     assert jnp.array_equal(unprefixed, baseline)
 
 
+def test_sample_actions_without_a_prefix_accepts_a_delay_distribution():
+    # The training graph carries rtc_delay_probs, and a held-out check samples from that graph
+    # as-is. Nothing in sampling reads the distribution, so refusing it would fail on a field the
+    # call never uses; the result is the unconditioned baseline, same as a constant-delay model.
+    key = jax.random.key(0)
+    obs = _tiny_config().fake_obs(1)
+    noise = jax.random.normal(jax.random.key(1), (1, 8, 4))
+
+    probs_model = _tiny_config(rtc_delay_probs=(0.75, 0.0, 0.25)).create(key)
+    baseline_model = _tiny_config().create(key)
+
+    unprefixed = probs_model.sample_actions(key, obs, num_steps=2, noise=noise)
+    baseline = baseline_model.sample_actions(key, obs, num_steps=2, noise=noise)
+    assert jnp.array_equal(unprefixed, baseline)
+
+
 def test_sample_actions_returns_a_given_prefix_verbatim():
     key = jax.random.key(0)
     model = _tiny_config(rtc_delay=2).create(key)
